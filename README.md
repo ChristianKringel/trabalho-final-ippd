@@ -159,7 +159,7 @@ Makefile são:
 | `make clean` | apaga os objetos e os binários |
 | `make test` | gera um áudio de um segundo e roda uma execução de sanidade com dois processos |
 | `make test_wav` | round-trip do leitor e escritor de WAV, só com `gcc`, sem MPI |
-| `make check` | bateria de corretude completa, dezoito verificações |
+| `make check` | bateria de corretude completa, dezessete verificações |
 | `make bench` | corretude mais varredura de desempenho, grava em `docs/` |
 
 O ambiente em que desenvolvemos usa Open MPI 4.1.2 e `mpicc` com `-fopenmp`, em
@@ -167,34 +167,192 @@ uma máquina de 28 núcleos.
 
 ## Onde o trabalho fica no Xivoco
 
-> **A preencher.** Esta seção descreve onde o projeto está hospedado no Xivoco e
-> como chegar até ele para rodar a demonstração na apresentação.
+O acesso ao Xivoco é feito pela página web da plataforma, que abre um terminal já
+dentro do ambiente. Ao subir o job, a plataforma entrega quatro máquinas, chamadas
+`master`, `worker-1`, `worker-2` e `worker-3`, e o terminal começa logado na
+`master` com o usuário `aluno`. O projeto fica em `/home/aluno/trabalho-final-ippd`,
+que é o diretório de onde todos os comandos desta seção são rodados. Não é preciso
+carregar módulo nem ativar ambiente nenhum: o `mpicc` e o `mpirun` já estão
+disponíveis, então um `make` na raiz compila direto. As máquinas se alcançam por
+SSH pelo nome curto e sem senha, e na primeira conexão o SSH imprime um aviso de
+chave adicionada à lista de hosts conhecidos, que é normal e não indica erro.
 
-- Endereço e forma de acesso: `TODO`
-- Usuário: `TODO`
-- Caminho do projeto na máquina: `TODO`
-- Como carregar o ambiente MPI, se for necessário: `TODO`
-- Número de núcleos por nó e limite recomendado de processos: `TODO`
+| máquina | núcleos | papel na execução |
+| ------- | ------- | ----------------- |
+| `master` | 4 | onde o terminal abre, onde o projeto está clonado e onde o rank 0 roda |
+| `worker-1` | 4 | só processa blocos, nunca abre arquivo |
+| `worker-2` | 4 | idem |
+| `worker-3` | 8 | idem |
 
-Para rodar distribuído em mais de um nó, monte um arquivo de hosts e passe para o
-`mpirun` com `--hostfile`. O `benchmark.sh` também aceita a opção e repassa para
-todas as execuções, então a bateria inteira roda multi-nó com um comando:
+Vale registrar que as máquinas não são iguais entre si: a `worker-3` tem oito
+núcleos e as outras três têm quatro. Isso não exige ajuste nenhum na linha de
+comando, porque a repartição automática de threads lê o número de núcleos da
+máquina em que cada processo caiu, e não um valor fixo combinado antes. O efeito
+aparece direto no log, onde o rank 3 abre oito threads enquanto os outros três
+abrem quatro.
+
+### Os arquivos de hosts
+
+Para rodar em mais de uma máquina, o `mpirun` precisa de um arquivo listando os
+nós. Mantemos dois, porque as duas coisas que fazemos no Xivoco pedem repartições
+diferentes. O `maquinas.txt` dá uma vaga para cada máquina:
 
 ```
-scripts/benchmark.sh --hostfile maquinas.txt
+master slots=1
+worker-1 slots=1
+worker-2 slots=1
+worker-3 slots=1
 ```
+
+Com uma vaga por máquina e quatro processos, o MPI é obrigado a colocar um processo
+em cada nó, que é exatamente o que a demonstração precisa mostrar. Se as vagas
+fossem quatro por máquina, os quatro processos caberiam todos na `master` e a
+execução, apesar de correta, não provaria nada sobre vários nós. A `master` vem
+primeiro na lista de propósito, porque o rank 0 vai para o primeiro host da lista e
+o rank 0 é o único processo que lê e escreve arquivo.
+
+O `maquinas_bench.txt` dá quatro vagas para cada máquina, totalizando dezesseis:
+
+```
+master slots=4
+worker-1 slots=4
+worker-2 slots=4
+worker-3 slots=4
+```
+
+Esse é o arquivo do `benchmark.sh`, que chega a oito processos e por isso não
+caberia nas quatro vagas do outro arquivo. Para criar os dois de uma vez:
+
+```
+printf 'master slots=1\nworker-1 slots=1\nworker-2 slots=1\nworker-3 slots=1\n' > maquinas.txt
+printf 'master slots=4\nworker-1 slots=4\nworker-2 slots=4\nworker-3 slots=4\n' > maquinas_bench.txt
+```
+
+### Copiar o binário para os outros nós
+
+Aqui aparece a primeira consequência prática de não haver disco compartilhado, e
+ela vem antes de qualquer coisa relacionada ao áudio: o `mpirun` não copia o
+executável para as outras máquinas. Se o `processa_audio` existir só na `master`,
+os três workers não têm o que executar. Depois de compilar, é preciso mandar o
+binário para os outros nós, no mesmo caminho:
+
+```
+make
+for no in worker-1 worker-2 worker-3; do
+  ssh $no "mkdir -p ~/trabalho-final-ippd"
+  scp processa_audio $no:~/trabalho-final-ippd/
+done
+```
+
+O caminho tem que ser igual nas quatro máquinas porque o `mpirun` usa o diretório
+de trabalho atual também nos nós remotos. Para conferir que o binário chegou nos
+quatro, dá para pedir o `ls` a todos eles de uma vez:
+
+```
+mpirun -np 4 --hostfile maquinas.txt ls -l ~/trabalho-final-ippd/processa_audio
+```
+
+![Hostfile, nomes dos quatro nós e cópia do binário](prints/04-hostfile-e-binario-nos-quatro-nos.png)
+
+### A demonstração de que o disco não é compartilhado
+
+Esta é a parte que mostra, no próprio terminal, o problema que o trabalho contorna.
+A ideia é colocar o áudio de entrada em `/tmp`, que é disco local de cada máquina, e
+criar o arquivo apenas na `master`:
+
+```
+mkdir -p /tmp/demo_ippd
+cp data/entrada/testeLucas.wav /tmp/demo_ippd/
+```
+
+Feito isso, basta perguntar às quatro máquinas se elas enxergam esse arquivo. O
+comando abaixo roda um `hostname` e um `ls` dentro de cada processo, então cada
+máquina responde por si:
+
+```
+mpirun -np 4 --hostfile maquinas.txt sh -c 'echo "$(hostname): $(ls -l /tmp/demo_ippd/testeLucas.wav 2>&1)"'
+```
+
+A resposta deixa claro que três das quatro não têm o arquivo:
+
+```
+master: -rw-r--r-- 1 aluno aluno 869214 Jul 24 20:58 /tmp/demo_ippd/testeLucas.wav
+worker-1: ls: cannot access '/tmp/demo_ippd/testeLucas.wav': No such file or directory
+worker-2: ls: cannot access '/tmp/demo_ippd/testeLucas.wav': No such file or directory
+worker-3: ls: cannot access '/tmp/demo_ippd/testeLucas.wav': No such file or directory
+```
+
+E, mesmo assim, o processamento roda nas quatro:
+
+```
+mpirun -np 4 --hostfile maquinas.txt --bind-to none ./processa_audio \
+  /tmp/demo_ippd/testeLucas.wav \
+  /tmp/demo_ippd/saida.wav \
+  /tmp/demo_ippd/metrica.csv \
+  --passa-alta 48 --normalizar 0.95 --verbose 2>&1 | grep -vE "Thread [0-9]+\]"
+```
+
+```
+[Rank 0] Lendo arquivo de entrada '/tmp/demo_ippd/testeLucas.wav' do disco.
+[Rank 0] Audio: 434568 amostras, 48000 Hz, 1 canal(is), 16 bits.
+[Rank 0] Threads OpenMP por processo: 4 (1 processo(s) neste no, 4 nucleos) [automatico]
+[Rank 0] Recebi bloco de 108642 amostras (offset 0), vou usar 4 thread(s) OpenMP.
+[Rank 1] Recebi bloco de 108642 amostras (offset 108642), vou usar 4 thread(s) OpenMP.
+[Rank 3] Recebi bloco de 108642 amostras (offset 325926), vou usar 8 thread(s) OpenMP.
+[Rank 2] Recebi bloco de 108642 amostras (offset 217284), vou usar 4 thread(s) OpenMP.
+[Rank 0] Normalizacao: pico global=0.8105 alvo=0.9500 fator=1.1722
+[Rank 1] Bloco processado em 0.0449 s | RMS=0.0761 pico=0.6654 freq_dom=417.5 Hz
+[Rank 2] Bloco processado em 0.0420 s | RMS=0.0673 pico=0.5944 freq_dom=388.2 Hz
+[Rank 0] Bloco processado em 0.0723 s | RMS=0.0776 pico=0.9500 freq_dom=566.9 Hz
+[Rank 3] Bloco processado em 0.0672 s | RMS=0.0456 pico=0.4371 freq_dom=492.2 Hz
+[Rank 0] Escrevendo arquivo de saida '/tmp/demo_ippd/saida.wav' no disco.
+[Rank 0] Escrevendo metricas em '/tmp/demo_ippd/metrica.csv'.
+[Rank 0] Processamento do bloco: max=0.0723 s min=0.0420 s (desbalanceio 42.0%)
+[Rank 0] Tempo total (parede) com 4 processo(s): 0.1026 s
+```
+
+![O arquivo existe só na master e a execução funciona nos quatro nós](prints/06-disco-nao-compartilhado.png)
+
+No fim, um `ls -l /tmp/demo_ippd/` na `master` mostra o `saida.wav` e o
+`metrica.csv` que apareceram ali, escritos pelo rank 0, e os três workers continuam
+sem nada nessa pasta. Os ranks 1, 2 e 3 processaram 108642 amostras cada um sem
+nunca ter aberto um arquivo.
 
 Vale reforçar aqui a decisão de projeto descrita no começo: só o rank 0 toca o
-disco. Isso é justamente o que permite rodar em vários nós sem sistema de arquivos
-compartilhado — os outros processos recebem as amostras por mensagem e não precisam
-que o arquivo de entrada exista na máquina deles. Na prática, o arquivo de áudio só
-precisa estar no nó onde o rank 0 for escalonado.
+disco. É justamente isso que permite rodar em vários nós sem sistema de arquivos
+compartilhado, porque os outros processos recebem as amostras por mensagem e não
+precisam que o arquivo de entrada exista na máquina deles. Na prática, o áudio só
+precisa estar no nó onde o rank 0 for escalonado, e é por isso que a `master`
+aparece primeiro no arquivo de hosts.
 
-Uma consequência da repartição automática de threads também aparece aqui: o
-programa conta quantos processos existem **no mesmo nó**, não no mundo, para
-decidir quantas threads abrir. Com dois nós de 28 núcleos e oito processos, são
-quatro processos por nó e sete threads cada, e não oito processos disputando um
-mesmo total.
+Uma consequência da repartição automática de threads também aparece nessa execução:
+o programa conta quantos processos existem **no mesmo nó**, não no mundo, para
+decidir quantas threads abrir. Com um processo por máquina, cada rank fica com todos
+os núcleos do nó onde caiu, o que dá quatro threads em três nós e oito threads na
+`worker-3`. O desbalanceio de 42% que aparece no log vem em boa parte daí: os blocos
+têm o mesmo tamanho, mas as máquinas que os processam não têm a mesma capacidade.
+
+### A bateria de corretude no Xivoco
+
+A bateria do `benchmark.sh` também roda na plataforma. Rodando só a parte de
+corretude na `master`, as dezessete verificações passam:
+
+```
+scripts/benchmark.sh --so-corretude
+```
+
+![Bateria de corretude rodando no Xivoco](prints/01-corretude-no-xivoco.png)
+
+Para rodar a bateria inteira distribuída, incluindo a varredura de desempenho, o
+script aceita o arquivo de hosts e repassa para todas as execuções:
+
+```
+scripts/benchmark.sh --hostfile maquinas_bench.txt --audio /tmp/demo_ippd/testeLucas.wav
+```
+
+Nesse modo a troca de halo e a redução global da normalização passam pela rede de
+verdade, e não pela memória compartilhada de uma única máquina, que é uma condição
+que a nossa máquina de desenvolvimento nunca exercitou.
 
 ## Como executar
 
@@ -578,17 +736,17 @@ Ou diretamente, para controlar a varredura:
 ```
 scripts/benchmark.sh --audio data/entrada/longo.wav --reps 9
 scripts/benchmark.sh --np "1 2 4" --threads "1 4"
-scripts/benchmark.sh --hostfile maquinas.txt      # execução multi-nó
+scripts/benchmark.sh --hostfile maquinas_bench.txt # execução multi-nó
 ```
 
-A parte de corretude tem dezoito verificações, e a maioria delas é do mesmo tipo:
+A parte de corretude tem dezessete verificações, e a maioria delas é do mesmo tipo:
 processar o mesmo áudio com números diferentes de processos e exigir que a saída
 seja **byte a byte idêntica**. Isso vale para a identidade sem filtros, para cada
-filtro de vizinhança separadamente (que só casam se o halo estiver correto), para
-a cadeia completa com normalização, e para o caso-limite em que o raio do filtro é
-exatamente igual ao menor bloco. Há também a verificação de que as métricas não
+filtro de vizinhança separadamente (que só casam se o halo estiver correto) e para
+a cadeia completa com normalização. Há também a verificação de que as métricas não
 mudam com o número de threads, que existe porque a FFT tem três caminhos de código
-diferentes conforme quantas threads existem, e todos precisam concordar. O script
+diferentes conforme quantas threads existem, e todos precisam concordar, e a
+verificação de que um raio maior que o menor bloco é recusado com erro claro. O script
 sai com código de erro se qualquer uma falhar, e avisa que os tempos não
 significam nada quando há falha de corretude.
 
@@ -620,11 +778,9 @@ arquivo com um, quatro e oito processos, o que só acontece se o halo estiver
 correto; que a cadeia completa de convolução, eco e normalização também é
 invariante, o que exercita a redução global; que as métricas não mudam com o número
 de threads, verificação que existe porque a FFT tem três caminhos de código
-diferentes conforme quantas threads existem; e os dois lados do caso-limite do
-halo, em um áudio de 44 amostras onde com quatro processos o menor bloco é
-exatamente 11: raio 11 tem que casar com a execução de um processo, e raio 12 tem
-que ser **recusado com erro**, não dar um resultado errado em silêncio. Na última
-execução, as dezoito verificações passaram.
+diferentes conforme quantas threads existem; e que um raio maior que o menor bloco
+é **recusado com erro**, em vez de devolver um resultado errado em silêncio. Na
+última execução na `master` do Xivoco, as dezessete verificações passaram.
 
 Duas conferências numéricas complementam isso, e ambas conferem. O filtro de ganho
 escala a energia na proporção exata: sobre o `curto.wav`, o RMS de cada bloco cai
@@ -683,4 +839,8 @@ dados crus de cada configuração, com mínimo e máximo além da mediana, em
 
 ## Integrantes do grupo
 
-[nomes dos integrantes]
+| integrante | GitHub |
+| ---------- | ------ |
+| Christian Kringel | [ChristianKringel](https://github.com/ChristianKringel) |
+| Lucas Aniceto | [LucasAniceto](https://github.com/LucasAniceto) |
+| Rodrigo Santos | [RcmSantos274](https://github.com/RcmSantos274) |

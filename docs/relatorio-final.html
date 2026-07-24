@@ -1,0 +1,786 @@
+<meta charset="utf-8">
+<title>Trabalho Final: Processamento de Sinais de Audio em Lote com MPI e OpenMP</title>
+<style>
+  @page { size: A4; margin: 26mm 27mm 24mm 27mm; }
+
+  html { font-size: 11pt; }
+  body {
+    font-family: "Nimbus Roman", "Liberation Serif", "Times New Roman", Times, serif;
+    line-height: 1.36;
+    color: #000;
+    text-align: justify;
+  }
+
+  /* ------------------------------------------------ cabecalho ------------ */
+  h1 {
+    font-size: 1.32rem;
+    font-weight: bold;
+    text-align: center;
+    margin: 0 0 0.75em;
+    line-height: 1.3;
+  }
+  .autor, .email, .prof, .repo {
+    text-align: center;
+    margin: 0 0 0.16em;
+  }
+  .email, .repo { font-size: 0.955rem; }
+  .prof { margin-top: 0.16em; }
+  .repo { margin-top: 0.5em; }
+  hr.filete {
+    border: 0;
+    border-top: 0.7pt solid #000;
+    margin: 0.75em 0 1.6em;
+  }
+
+  /* ------------------------------------------------ secoes --------------- */
+  h2 {
+    font-size: 1.075rem;
+    font-weight: bold;
+    text-align: left;
+    margin: 1.5em 0 0.5em;
+    page-break-after: avoid;
+  }
+  h3 {
+    font-size: 1rem;
+    font-weight: bold;
+    text-align: left;
+    margin: 1.15em 0 0.4em;
+    page-break-after: avoid;
+  }
+  p { margin: 0 0 0.55em; }
+  ul, ol { margin: 0 0 0.7em; padding-left: 1.6em; }
+  li { margin-bottom: 0.35em; }
+
+  /* ------------------------------------------------ codigo --------------- */
+  code {
+    font-family: "Nimbus Mono PS", "Liberation Mono", "Courier New", Courier, monospace;
+    font-size: 0.855em;
+  }
+  pre {
+    font-family: "Nimbus Mono PS", "Liberation Mono", "Courier New", Courier, monospace;
+    font-size: 8pt;
+    line-height: 1.3;
+    margin: 0.35em 0 0.85em;
+    white-space: pre-wrap;
+    word-break: break-word;
+    text-align: left;
+  }
+
+  /* ------------------------------------------------ tabelas -------------- */
+  table {
+    border-collapse: collapse;
+    margin: 0.7em auto 1em;
+    font-size: 0.925rem;
+    page-break-inside: avoid;
+  }
+  caption {
+    caption-side: top;
+    font-size: 0.925rem;
+    text-align: left;
+    margin-bottom: 0.3em;
+  }
+  thead th {
+    font-weight: bold;
+    border-top: 1pt solid #000;
+    border-bottom: 0.6pt solid #000;
+    padding: 3px 9px;
+    text-align: left;
+  }
+  tbody td { padding: 2.5px 9px; text-align: left; vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 1pt solid #000; }
+  td.num, th.num { text-align: right; }
+  .larga { width: 100%; }
+
+  /* ------------------------------------------------ figuras -------------- */
+  figure { margin: 0.8em 0 1.1em; page-break-inside: avoid; text-align: center; }
+  figure img { width: 100%; display: block; }
+  figcaption {
+    font-size: 0.925rem;
+    margin-top: 0.45em;
+    text-align: left;
+  }
+</style>
+
+<h1>Trabalho Final: Processamento de Sinais de Áudio em Lote com MPI e OpenMP</h1>
+<p class="autor">Christian Rodrigo Miritz Kringel</p>
+<p class="autor">Lucas Aniceto</p>
+<p class="autor">Rodrigo Santos</p>
+<p class="prof">Prof. Gerson Geraldo Homrich Cavalheiro</p>
+<p class="repo">https://github.com/ChristianKringel/trabalho-final-ippd</p>
+<hr class="filete">
+
+<h2>1. Introdução e escolha do tema</h2>
+
+<p>Implementamos em C um programa que lê um arquivo de áudio WAV, distribui as
+amostras entre vários processos MPI, aplica filtros digitais e calcula métricas do
+sinal em paralelo com OpenMP, e no fim remonta o áudio processado em um único
+arquivo de saída. O trabalho roda em quatro máquinas do Xivoco que não compartilham
+disco, e a solução para esse problema é a decisão central do projeto: apenas o
+processo de rank 0 tem contato com arquivos.</p>
+
+<p>O tema foi liberado pelo enunciado, com a condição de que o problema escolhido
+manipulasse um arquivo, justamente porque a máquina virtual MPI não compartilha
+disco entre os nós e esse obstáculo precisava ser contornado. Escolhemos
+processamento de áudio porque ele atende a essa condição de forma natural e ainda
+combina bem com os dois níveis de paralelismo pedidos: o arquivo de entrada é grande
+e indivisível do ponto de vista do disco, então a leitura precisa ser centralizada e
+o conteúdo distribuído por mensagem; as amostras são independentes entre si em
+vários filtros, o que dá uma decomposição limpa por blocos para o MPI; dentro de
+cada bloco o laço sobre as amostras é trivialmente paralelizável, o que dá trabalho
+para o OpenMP; e alguns filtros dependem de amostras vizinhas, o que obriga a troca
+de bordas entre processos e torna o problema mais interessante do que uma simples
+divisão em partes iguais.</p>
+
+<p>Além dos filtros, o programa calcula três métricas por bloco: energia RMS, pico
+de amplitude e frequência dominante. A frequência dominante exige uma transformada
+de Fourier, que implementamos à mão para não depender de biblioteca externa.</p>
+
+<h2>2. O requisito do arquivo e a decisão de projeto</h2>
+
+<p>À primeira vista, processar áudio em paralelo parece simples: basta dividir o
+vetor de amostras em partes iguais e mandar cada parte para um processo. O
+complicador é que as máquinas não compartilham sistema de arquivos. Se cada processo
+tentasse abrir o arquivo de entrada por conta própria, a maioria deles simplesmente
+não o encontraria, porque o arquivo existe apenas em uma das máquinas.</p>
+
+<p>Por causa disso, decidimos que <b>apenas o processo de rank 0 tem contato com o
+disco</b>. Ele é o único que lê o arquivo de entrada e o único que escreve o arquivo
+de áudio de saída e o arquivo de métricas. Todos os outros processos nunca abrem
+arquivo nenhum: recebem as amostras que precisam processar diretamente do rank 0,
+por mensagens MPI, e devolvem o resultado da mesma forma. Essa decisão aparece em
+todo o código e é, na prática, o que torna a solução compatível com o ambiente de
+execução. A seção 7 mostra essa propriedade sendo verificada no terminal do
+Xivoco.</p>
+
+<h2>3. Arquitetura da solução</h2>
+
+<h3>3.1 Distribuição dos blocos entre processos</h3>
+
+<p>O rank 0 lê o arquivo inteiro e converte as amostras de inteiros de 16 bits para
+ponto flutuante no intervalo de menos um a mais um, que é um formato mais
+confortável para filtros e para a transformada de Fourier. Em seguida calcula como
+dividir o total de amostras entre os processos. Como o número de amostras quase
+nunca é múltiplo exato do número de processos, não dá para dividir em partes iguais,
+então usamos <code>MPI_Scatterv</code> e <code>MPI_Gatherv</code>, que aceitam
+blocos de tamanhos diferentes. O resto da divisão é distribuído de um em um entre os
+primeiros processos, de modo que a diferença de tamanho entre qualquer par de blocos
+seja no máximo de uma amostra.</p>
+
+<p>Depois do Scatterv, cada processo trabalha apenas na sua parte, sem precisar
+conhecer o restante do áudio. Isso é possível porque os filtros ponto a ponto, como
+o ganho e o gate por limiar, calculam cada amostra de saída a partir apenas da
+amostra de entrada correspondente. Terminado o processamento, o rank 0 recolhe os
+blocos com Gatherv, remontando o áudio na ordem correta, e escreve a saída.</p>
+
+<h3>3.2 Troca de halo nos filtros de vizinhança</h3>
+
+<p>Implementamos também filtros em que cada amostra de saída depende das vizinhas:
+uma média móvel, que funciona como passa-baixa, um passa-alta derivado dela, e um
+eco. Nas bordas de cada bloco, parte dessas vizinhas está no bloco do processo ao
+lado. Para resolver isso, antes de aplicar o filtro cada processo troca com os
+vizinhos uma margem de amostras, o halo, usando <code>MPI_Sendrecv</code>. Com essa
+margem no lugar, o resultado nas fronteiras entre blocos fica igual ao que sairia se
+o áudio tivesse sido processado inteiro de uma vez. Nas duas pontas do áudio, onde
+não há vizinho, a margem é preenchida com zeros. No caso do eco, que só depende de
+amostras anteriores, a troca é feita apenas para o lado esquerdo.</p>
+
+<p>Esse é o ponto do projeto em que um erro não apareceria como travamento, e sim
+como um resultado sutilmente errado nas juntas entre blocos. Por isso a bateria de
+testes descrita na seção 8 compara a saída de execuções com números diferentes de
+processos e exige igualdade byte a byte.</p>
+
+<h3>3.3 Redução global na normalização</h3>
+
+<p>A normalização é o filtro mais interessante do ponto de vista de paralelismo,
+porque precisa de uma informação que nenhum processo tem sozinho: o maior pico do
+áudio inteiro, que está espalhado entre os blocos. Cada processo calcula o pico do
+seu bloco e, com <code>MPI_Allreduce</code> usando a operação de máximo, todos
+passam a conhecer o mesmo pico global e aplicam exatamente o mesmo fator de escala.
+Como a normalização roda depois dos outros filtros, ela leva em conta o efeito
+deles.</p>
+
+<h3>3.4 OpenMP dentro de cada bloco</h3>
+
+<p>Dentro de cada bloco, o laço que percorre as amostras é paralelizado com OpenMP,
+de forma que várias threads dividem o trabalho do bloco entre si. Assim existem dois
+níveis de paralelismo simultâneos: o MPI separando o áudio em blocos entre
+processos, e o OpenMP dividindo cada bloco entre threads.</p>
+
+<p>O número de threads não precisa ser configurado à mão. Se
+<code>OMP_NUM_THREADS</code> não estiver definido, cada processo abre um número de
+threads igual aos núcleos da máquina dividido pelos processos que estão <b>no mesmo
+nó</b>, e não no mundo. Isso existe porque o padrão do OpenMP é abrir uma thread por
+núcleo em cada processo, o que com quatro processos em 28 núcleos daria 112 threads
+disputando 28 núcleos. Contar apenas os processos do próprio nó também evita que uma
+execução distribuída fique subutilizada.</p>
+
+<h3>3.5 Transformada de Fourier própria</h3>
+
+<p>Optamos por implementar a transformada rápida de Fourier nós mesmos, pelo
+algoritmo de Cooley-Tukey na forma iterativa, em vez de usar biblioteca pronta. A
+escolha foi tanto para não depender de nada que pudesse não estar instalado no
+ambiente de execução quanto porque escrever a transformada à mão deixa mais claro o
+que está acontecendo. Antes de calcular o espectro aplicamos uma janela de Hann
+sobre o trecho, o que reduz o vazamento espectral e deixa a leitura da frequência
+dominante mais precisa. A FFT tem três caminhos de código conforme o número de
+threads disponíveis, e a bateria de testes verifica que os três concordam.</p>
+
+<h2>4. Trechos de código</h2>
+
+<p>O código completo está no repositório indicado no cabeçalho, distribuído em seis
+arquivos em <code>src/</code>. Reproduzimos aqui os quatro trechos que concentram as
+decisões de paralelismo.</p>
+
+<p><b>A distribuição dos blocos</b>, em <code>src/main.c</code>. O
+<code>Bcast</code> leva o formato do áudio para todos, e o <code>Scatterv</code>
+leva os blocos, que têm tamanhos diferentes descritos em <code>counts</code> e
+<code>displs</code>:</p>
+
+<pre>// Passo 2: todos ficam sabendo o formato/tamanho do audio
+MPI_Bcast(&amp;info, sizeof(WavInfo), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+int total_valores = (int)(info.num_amostras * info.num_canais);
+
+// Cada processo calcula a mesma particao de forma deterministica
+[...]
+
+// Passo 3: distribuicao dos blocos
+MPI_Scatterv(audio_total, counts, displs, MPI_FLOAT,
+             bloco_local, meu_tamanho, MPI_FLOAT,
+             0, MPI_COMM_WORLD);</pre>
+
+<p><b>A troca de halo</b>, em <code>src/mpi_utils.c</code>. Os dois
+<code>Sendrecv</code> resolvem as duas bordas, e o uso de
+<code>MPI_PROC_NULL</code> nas pontas do áudio evita qualquer caso especial no
+código:</p>
+
+<pre>void trocar_halo(const float *bloco, int n, int raio, int rank, int n_procs,
+                 float *estendido) {
+    // Zera primeiro: as extremidades globais ja ficam com halo de zeros
+    memset(estendido, 0, (n + 2 * raio) * sizeof(float));
+    memcpy(estendido + raio, bloco, n * sizeof(float));
+
+    // Nas pontas, MPI_PROC_NULL faz o Sendrecv virar operacao nula e o halo
+    // daquele lado continua zerado
+    int esquerda = (rank == 0)            ? MPI_PROC_NULL : rank - 1;
+    int direita  = (rank == n_procs - 1)  ? MPI_PROC_NULL : rank + 1;
+
+    MPI_Status status;
+
+    // Envia as primeiras 'raio' amostras para a esquerda e recebe da direita o
+    // meu halo direito
+    MPI_Sendrecv(estendido + raio,     raio, MPI_FLOAT, esquerda, 0,
+                 estendido + raio + n, raio, MPI_FLOAT, direita,  0,
+                 MPI_COMM_WORLD, &amp;status);
+
+    // Envia as ultimas 'raio' amostras para a direita e recebe da esquerda o
+    // meu halo esquerdo
+    MPI_Sendrecv(estendido + n,        raio, MPI_FLOAT, direita,  1,
+                 estendido,            raio, MPI_FLOAT, esquerda, 1,
+                 MPI_COMM_WORLD, &amp;status);
+}</pre>
+
+<p><b>O paralelismo OpenMP dentro do bloco</b>, em <code>src/filtros.c</code>. Cada
+thread calcula a sua faixa de amostras, e a função de log existe para que a divisão
+apareça no terminal quando o programa roda com <code>--verbose</code>:</p>
+
+<pre>void aplicar_convolucao_media(const float *estendido, float *saida, int n,
+                              int raio, int rank) {
+    int comprimento = 2 * raio + 1;
+
+    #pragma omp parallel
+    {
+        int inicio, fim;
+        faixa_da_thread(n, &amp;inicio, &amp;fim);
+
+        // saida[i] usa estendido[i .. i + 2*raio]; o centro da janela e
+        // estendido[i + raio], que corresponde a amostra i do bloco
+        for (int i = inicio; i &lt; fim; i++) {
+            double soma = 0.0;
+            for (int k = 0; k &lt; comprimento; k++) {
+                soma += estendido[i + k];
+            }
+            [...]
+        }
+    }
+}</pre>
+
+<p><b>A redução em dois níveis</b>, também em <code>src/filtros.c</code>. O pico do
+bloco sai de uma redução OpenMP entre as threads, e o pico global sai de um
+<code>MPI_Allreduce</code> entre os processos. É o ponto em que os dois modelos de
+paralelismo se encaixam um dentro do outro:</p>
+
+<pre>float pico_local_bloco(const float *bloco, int n) {
+    float pico = 0.0f;
+    // reduction(max:pico) da a cada thread uma copia privada e combina no fim,
+    // sem condicao de corrida. Pico LOCAL; o global sai do Allreduce no main.
+    #pragma omp parallel for schedule(static) reduction(max:pico)
+    for (int i = 0; i &lt; n; i++) {
+        float a = fabsf(bloco[i]);
+        if (a &gt; pico) {
+            pico = a;
+        }
+    }
+    return pico;
+}</pre>
+
+<h2>5. Os filtros implementados</h2>
+
+<table class="larga">
+  <thead>
+    <tr><th>Flag</th><th>O que faz</th><th>Usa halo</th><th>Comunicação MPI extra</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>--ganho G</code></td><td>multiplica a amplitude por G</td><td>não</td><td>nenhuma</td></tr>
+    <tr><td><code>--threshold L</code></td><td>zera amostras com módulo abaixo de L</td><td>não</td><td>nenhuma</td></tr>
+    <tr><td><code>--convolucao R</code></td><td>média móvel de raio R (passa-baixa)</td><td>sim</td><td>Sendrecv nos dois lados</td></tr>
+    <tr><td><code>--passa-alta R</code></td><td>original menos a média móvel de raio R</td><td>sim</td><td>Sendrecv nos dois lados</td></tr>
+    <tr><td><code>--eco ATRASO ATEN</code></td><td>soma uma cópia atrasada e atenuada</td><td>só à esquerda</td><td>Sendrecv à esquerda</td></tr>
+    <tr><td><code>--normalizar ALVO</code></td><td>escala o áudio até o pico global virar ALVO</td><td>não</td><td>Allreduce de máximo</td></tr>
+    <tr><td><code>--no-parallel</code></td><td>força o OpenMP a uma única thread</td><td>-</td><td>nenhuma</td></tr>
+    <tr><td><code>--verbose</code></td><td>liga os logs por rank e por thread</td><td>-</td><td>nenhuma</td></tr>
+  </tbody>
+</table>
+
+<p>A ordem de aplicação é fixa no código e independe da ordem na linha de comando:
+ganho, threshold, convolução, passa-alta, eco e por último a normalização. A forma
+geral de rodar é:</p>
+
+<pre>mpirun -np &lt;N&gt; ./processa_audio &lt;entrada.wav&gt; &lt;saida.wav&gt; [metrica.csv] [flags]</pre>
+
+<p>O programa lê apenas WAV PCM de 16 bits, e recusa qualquer outro formato com uma
+mensagem clara. O número de canais e a taxa de amostragem são livres e vêm do
+cabeçalho. Áudio em MP3, OGG ou WAV de 24 ou 32 bits precisa ser convertido antes, o
+que fazemos com <code>ffmpeg -i entrada.ogg -c:a pcm_s16le saida.wav</code>.</p>
+
+<p>Duas flags do <code>mpirun</code> importam para medir. Por padrão o Open MPI
+amarra cada processo a um núcleo, o que prende todas as threads daquele rank no
+mesmo núcleo e faz o OpenMP parecer inútil, então qualquer execução em que o tempo
+importe usa <code>--bind-to none</code>. E o <code>--verbose</code> do nosso
+programa imprime de dentro da região cronometrada, o que infla os tempos, então ele
+serve para demonstrar a divisão do trabalho e não para medir. O programa avisa isso
+quando a flag é usada.</p>
+
+<h2>6. Ambiente de execução no Xivoco</h2>
+
+<p>O acesso ao Xivoco é feito pela página web da plataforma, que abre um terminal já
+dentro do ambiente. Ao subir o job, a plataforma entrega quatro máquinas e o
+terminal começa logado na <code>master</code> com o usuário <code>aluno</code>. O
+projeto fica em <code>/home/aluno/trabalho-final-ippd</code>. Não é preciso carregar
+módulo nem ativar ambiente: o <code>mpicc</code> e o <code>mpirun</code> já estão
+disponíveis, então <code>make</code> na raiz compila direto. As máquinas se alcançam
+por SSH pelo nome curto e sem senha.</p>
+
+<table>
+  <thead>
+    <tr><th>Máquina</th><th class="num">Núcleos</th><th>Papel na execução</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>master</code></td><td class="num">4</td><td>onde o terminal abre, onde o projeto está clonado e onde o rank 0 roda</td></tr>
+    <tr><td><code>worker-1</code></td><td class="num">4</td><td>só processa blocos, nunca abre arquivo</td></tr>
+    <tr><td><code>worker-2</code></td><td class="num">4</td><td>idem</td></tr>
+    <tr><td><code>worker-3</code></td><td class="num">8</td><td>idem</td></tr>
+  </tbody>
+</table>
+
+<p>Vale registrar que as máquinas não são iguais entre si: a <code>worker-3</code>
+tem oito núcleos e as outras três têm quatro. Isso não exigiu ajuste nenhum na linha
+de comando, porque a repartição automática de threads descrita na seção 3.4 lê o
+número de núcleos da máquina em que cada processo caiu, e não um valor fixo
+combinado antes. O efeito aparece direto no log de execução, em que o rank 3 abre
+oito threads enquanto os outros três abrem quatro.</p>
+
+<h3>6.1 Os arquivos de hosts</h3>
+
+<p>Para rodar em mais de uma máquina, o <code>mpirun</code> precisa de um arquivo
+listando os nós. Mantemos dois, porque as duas coisas que fazemos no Xivoco pedem
+repartições diferentes.</p>
+
+<pre>$ cat maquinas.txt              $ cat maquinas_bench.txt
+master   slots=1                master   slots=4
+worker-1 slots=1                worker-1 slots=4
+worker-2 slots=1                worker-2 slots=4
+worker-3 slots=1                worker-3 slots=4</pre>
+
+<p>Com uma vaga por máquina e quatro processos, o MPI é obrigado a colocar um
+processo em cada nó, que é exatamente o que a demonstração da seção 7 precisa
+mostrar. Se as vagas fossem quatro por máquina, os quatro processos caberiam todos
+na <code>master</code> e a execução, apesar de correta, não provaria nada sobre
+vários nós. A <code>master</code> vem primeiro na lista de propósito, porque o rank
+0 vai para o primeiro host e o rank 0 é o único processo que lê e escreve arquivo. O
+segundo arquivo, com dezesseis vagas no total, é o usado pela varredura de
+desempenho, que chega a oito processos.</p>
+
+<h3>6.2 Distribuição do binário</h3>
+
+<p>A primeira consequência prática de não haver disco compartilhado aparece antes de
+qualquer coisa relacionada ao áudio: o <code>mpirun</code> não copia o executável
+para as outras máquinas. Se o <code>processa_audio</code> existir apenas na
+<code>master</code>, os três workers não têm o que executar. Depois de compilar, é
+preciso mandar o binário para os outros nós, no mesmo caminho, porque o
+<code>mpirun</code> usa o diretório de trabalho atual também nos nós remotos.</p>
+
+<pre>make
+for no in worker-1 worker-2 worker-3; do
+  ssh $no "mkdir -p ~/trabalho-final-ippd"
+  scp processa_audio $no:~/trabalho-final-ippd/
+done
+
+mpirun -np 4 --hostfile maquinas.txt ls -l ~/trabalho-final-ippd/processa_audio</pre>
+
+<figure>
+  <img src="../prints/04-hostfile-e-binario-nos-quatro-nos.png" alt="Hostfile, nomes dos quatro nos e copia do binario">
+  <figcaption>Figura 1: o arquivo de hosts, a resposta das quatro máquinas ao
+  comando <code>hostname</code>, a cópia do binário por <code>scp</code> e a
+  confirmação de que o executável chegou aos quatro nós.</figcaption>
+</figure>
+
+<h2>7. A demonstração de que o disco não é compartilhado</h2>
+
+<p>Esta é a verificação que mostra, no próprio terminal, o problema que o trabalho
+contorna. A ideia é colocar o áudio de entrada em <code>/tmp</code>, que é disco
+local de cada máquina, e criar o arquivo apenas na <code>master</code>:</p>
+
+<pre>mkdir -p /tmp/demo_ippd
+cp data/entrada/testeLucas.wav /tmp/demo_ippd/</pre>
+
+<p>Feito isso, perguntamos às quatro máquinas se elas enxergam esse arquivo. O
+comando roda um <code>hostname</code> e um <code>ls</code> dentro de cada processo,
+então cada máquina responde por si:</p>
+
+<pre>$ mpirun -np 4 --hostfile maquinas.txt sh -c 'echo "$(hostname): $(ls -l /tmp/demo_ippd/testeLucas.wav 2&gt;&amp;1)"'
+
+master:   -rw-r--r-- 1 aluno aluno 869214 Jul 24 20:58 /tmp/demo_ippd/testeLucas.wav
+worker-1: ls: cannot access '/tmp/demo_ippd/testeLucas.wav': No such file or directory
+worker-2: ls: cannot access '/tmp/demo_ippd/testeLucas.wav': No such file or directory
+worker-3: ls: cannot access '/tmp/demo_ippd/testeLucas.wav': No such file or directory</pre>
+
+<p>Três das quatro máquinas não têm o arquivo. E, mesmo assim, o processamento roda
+nas quatro:</p>
+
+<pre>$ mpirun -np 4 --hostfile maquinas.txt --bind-to none ./processa_audio \
+    /tmp/demo_ippd/testeLucas.wav /tmp/demo_ippd/saida.wav /tmp/demo_ippd/metrica.csv \
+    --passa-alta 48 --normalizar 0.95 --verbose
+
+[Rank 0] Lendo arquivo de entrada '/tmp/demo_ippd/testeLucas.wav' do disco.
+[Rank 0] Audio: 434568 amostras, 48000 Hz, 1 canal(is), 16 bits.
+[Rank 0] Threads OpenMP por processo: 4 (1 processo(s) neste no, 4 nucleos) [automatico]
+[Rank 0] Recebi bloco de 108642 amostras (offset 0), vou usar 4 thread(s) OpenMP.
+[Rank 1] Recebi bloco de 108642 amostras (offset 108642), vou usar 4 thread(s) OpenMP.
+[Rank 3] Recebi bloco de 108642 amostras (offset 325926), vou usar 8 thread(s) OpenMP.
+[Rank 2] Recebi bloco de 108642 amostras (offset 217284), vou usar 4 thread(s) OpenMP.
+[Rank 0] Normalizacao: pico global=0.8105 alvo=0.9500 fator=1.1722
+[Rank 1] Bloco processado em 0.0449 s | RMS=0.0761 pico=0.6654 freq_dom=417.5 Hz
+[Rank 2] Bloco processado em 0.0420 s | RMS=0.0673 pico=0.5944 freq_dom=388.2 Hz
+[Rank 0] Bloco processado em 0.0723 s | RMS=0.0776 pico=0.9500 freq_dom=566.9 Hz
+[Rank 3] Bloco processado em 0.0672 s | RMS=0.0456 pico=0.4371 freq_dom=492.2 Hz
+[Rank 0] Escrevendo arquivo de saida '/tmp/demo_ippd/saida.wav' no disco.
+[Rank 0] Escrevendo metricas em '/tmp/demo_ippd/metrica.csv'.
+[Rank 0] Processamento do bloco: max=0.0723 s min=0.0420 s (desbalanceio 42.0%)
+[Rank 0] Tempo total (parede) com 4 processo(s): 0.1026 s</pre>
+
+<figure>
+  <img src="../prints/06-disco-nao-compartilhado.png" alt="O arquivo existe so na master e a execucao funciona nos quatro nos">
+  <figcaption>Figura 2: os três workers respondem que o arquivo não existe, e logo
+  abaixo os quatro processos processam 108642 amostras cada um. Os ranks 1, 2 e 3
+  nunca abriram arquivo: receberam as amostras por mensagem MPI.</figcaption>
+</figure>
+
+<p>Esse log resume o funcionamento do programa. As 434568 amostras foram divididas
+em quatro blocos iguais de 108642, cada um com o seu deslocamento; a normalização
+encontrou o pico global de 0,8105 por redução coletiva e aplicou o mesmo fator de
+1,1722 em todos os processos; e no fim apenas o rank 0 escreveu os arquivos, que
+apareceram somente na <code>master</code>.</p>
+
+<p>O desbalanceio de 42% entre o bloco mais lento e o mais rápido tem uma explicação
+direta neste ambiente: os blocos têm o mesmo tamanho, mas as máquinas que os
+processam não têm a mesma capacidade, como mostra a tabela da seção 6.</p>
+
+<h2>8. Corretude</h2>
+
+<p>A corretude está automatizada em <code>make check</code>, que roda a bateria de
+<code>scripts/benchmark.sh</code>. São dezessete verificações, e a ideia por trás da
+maioria delas é sempre a mesma: <b>o resultado não pode depender de como o trabalho
+foi dividido</b>. Processamos o mesmo áudio com números diferentes de processos e
+exigimos que a saída seja byte a byte idêntica.</p>
+
+<table class="larga">
+  <thead>
+    <tr><th>Grupo de verificações</th><th class="num">Qtd.</th><th>O que garante</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Round-trip do leitor e escritor de WAV</td><td class="num">1</td><td>o programa lê corretamente o que escreveu, sem MPI</td></tr>
+    <tr><td>Identidade sem filtros contra a entrada</td><td class="num">1</td><td>Scatterv e Gatherv não corrompem nem reordenam amostras</td></tr>
+    <tr><td>Identidade com 2, 4 e 8 processos</td><td class="num">3</td><td>a divisão em blocos desiguais está correta</td></tr>
+    <tr><td>Halo de convolução, passa-alta e eco</td><td class="num">6</td><td>a troca de bordas está correta; sem ela as juntas entre blocos diferem</td></tr>
+    <tr><td>Cadeia convolução + eco + normalização</td><td class="num">1</td><td>a redução global do pico é consistente entre processos</td></tr>
+    <tr><td>Métricas com 1, 2, 3, 4 e 8 threads</td><td class="num">4</td><td>os três caminhos de código da FFT concordam</td></tr>
+    <tr><td>Raio maior que o menor bloco</td><td class="num">1</td><td>o caso inválido é recusado com erro claro, não em silêncio</td></tr>
+  </tbody>
+</table>
+
+<figure>
+  <img src="../prints/01-corretude-no-xivoco.png" alt="Bateria de corretude rodando no Xivoco">
+  <figcaption>Figura 3: compilação e bateria de corretude na <code>master</code> do
+  Xivoco. As dezessete verificações passaram.</figcaption>
+</figure>
+
+<p>Duas conferências numéricas complementam a bateria automatizada, e ambas
+conferem. O filtro de ganho escala a energia na proporção exata: sobre o áudio
+curto, o RMS de cada bloco cai de 0,5683 para 0,2842 com <code>--ganho 0.5</code>,
+uma razão de 0,5000 em todos os quatro blocos. E a frequência dominante calculada
+pela nossa transformada dá 441,43 Hz para um seno gerado em 440 Hz, o que fica
+dentro de um bin da FFT naquele tamanho de bloco.</p>
+
+<h2>9. Desempenho</h2>
+
+<p>A tabela de referência não é escrita à mão: é gerada por <code>make bench</code>
+e fica em <code>docs/resultados.md</code>, junto com o ambiente em que foi medida. A
+varredura abaixo é da nossa máquina de desenvolvimento, com 28 núcleos, sobre um
+áudio de 30 segundos com <code>--passa-alta 48</code>, mediana de cinco repetições.
+Escolhemos apresentar essa varredura como estudo de escalabilidade porque ela tem
+núcleos suficientes para separar o efeito dos processos do efeito das threads sem
+disputa por CPU, o que as máquinas de quatro núcleos do Xivoco não permitem.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th class="num">Processos</th><th class="num">Threads</th>
+      <th class="num">t_local (s)</th><th class="num">t_total (s)</th><th class="num">Speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td class="num">1</td><td class="num">1</td><td class="num">0,1258</td><td class="num">0,1303</td><td class="num">1,00x</td></tr>
+    <tr><td class="num">1</td><td class="num">2</td><td class="num">0,1002</td><td class="num">0,1039</td><td class="num">1,25x</td></tr>
+    <tr><td class="num">1</td><td class="num">4</td><td class="num">0,0572</td><td class="num">0,0611</td><td class="num">2,13x</td></tr>
+    <tr><td class="num">1</td><td class="num">8</td><td class="num">0,0415</td><td class="num">0,0464</td><td class="num">2,81x</td></tr>
+    <tr><td class="num">2</td><td class="num">1</td><td class="num">0,0721</td><td class="num">0,0774</td><td class="num">1,68x</td></tr>
+    <tr><td class="num">2</td><td class="num">4</td><td class="num">0,0445</td><td class="num">0,0498</td><td class="num">2,62x</td></tr>
+    <tr><td class="num">2</td><td class="num">8</td><td class="num">0,0252</td><td class="num">0,0305</td><td class="num">4,28x</td></tr>
+    <tr><td class="num">4</td><td class="num">1</td><td class="num">0,0286</td><td class="num">0,0341</td><td class="num">3,83x</td></tr>
+    <tr><td class="num">4</td><td class="num">4</td><td class="num">0,0217</td><td class="num">0,0265</td><td class="num">4,91x</td></tr>
+    <tr><td class="num">8</td><td class="num">1</td><td class="num"><b>0,0165</b></td><td class="num"><b>0,0200</b></td><td class="num"><b>6,52x</b></td></tr>
+    <tr><td class="num">8</td><td class="num">2</td><td class="num">0,0198</td><td class="num">0,0244</td><td class="num">5,35x</td></tr>
+  </tbody>
+</table>
+
+<p><code>t_local</code> é o processamento do bloco, tomado como o máximo entre os
+processos; <code>t_total</code> é a região paralela inteira, incluindo Scatterv e
+Gatherv. A referência sequencial explícita, com um processo e o OpenMP desligado
+pelo próprio programa, ficou em 0,109 s. A tabela completa, incluindo as
+configurações em que processos vezes threads passa dos 28 núcleos e por isso há
+disputa por CPU, está em <code>docs/resultados.md</code>, e os dados crus com mínimo
+e máximo de cada configuração em <code>docs/resultados.csv</code>.</p>
+
+<h3>9.1 Leitura dos resultados</h3>
+
+<p>Os dois níveis de paralelismo ajudam, e o MPI ajuda mais que o OpenMP: sozinho, o
+OpenMP tira 2,81 vezes com oito threads em um processo, enquanto oito processos de
+uma thread tiram 6,52 vezes. Isso é coerente com a estrutura do programa, em que
+parte do custo por rank está fora dos laços paralelizados. Em
+<code>filtrar_com_vizinhanca</code>, cada chamada faz duas alocações, a cópia do
+halo e um <code>memcpy</code> de volta, tudo proporcional ao tamanho do bloco e tudo
+serial dentro do processo. O MPI reduz esse tamanho dividindo o áudio; o OpenMP não.
+É uma leitura sustentada pelas medições, e não algo confirmado com profiler.</p>
+
+<p>O escalonamento também não é linear, e não deveria ser: parte do tempo é gasta
+espalhando e recolhendo os blocos, e essa parte não diminui quando se adicionam
+processos. Ela cresce, o que aparece com clareza no ambiente distribuído.</p>
+
+<h3>9.2 O custo da comunicação em rede</h3>
+
+<p>A execução multi-nó no Xivoco expôs um número que nenhuma medição em máquina
+única mostra. Com oito processos e uma thread cada, atravessando duas máquinas, o
+processamento do bloco levou 0,027 s mas a região paralela inteira levou 0,300 s. A
+diferença entre esses dois números é essencialmente o Scatterv e o Gatherv passando
+pela rede em vez da memória compartilhada. Na máquina local, na mesma configuração,
+essa diferença é de milésimos de segundo.</p>
+
+<p>Esse é o custo real da decisão de centralizar o disco no rank 0: todo o conteúdo
+do arquivo trafega pela rede duas vezes, uma na ida e uma na volta. Para o tamanho
+de áudio deste trabalho o custo é aceitável, mas ele mostra que a estratégia tem um
+limite, e a seção 11 comenta o que seria feito adiante.</p>
+
+<h3>9.3 Duas armadilhas de medição</h3>
+
+<p>Vale registrar duas coisas que encontramos pelo caminho, porque ambas fazem o
+paralelismo parecer inútil sem que haja nada de errado com o código.</p>
+
+<p>A primeira é a <b>amarração de CPU do <code>mpirun</code></b>. Com o padrão
+<code>--bind-to core</code>, todas as threads de um rank ficam presas em um núcleo
+só e o tempo trava em torno de 0,14 s independentemente de quantas threads se peça;
+com <code>--bind-to none</code> ele cai de 0,20 s para 0,06 s na mesma varredura.
+Sem essa flag, uma varredura de threads mede afinidade de CPU e não o código.</p>
+
+<p>A segunda é a <b>oversubscrição de threads</b>, que aparecia quando cada processo
+abria uma thread por núcleo: quatro processos em 28 núcleos davam 112 threads, e as
+barreiras da FFT tropeçavam no escalonador a ponto de o tempo <i>piorar</i> ao
+adicionar processos. Isso motivou duas mudanças no código: o programa passou a
+repartir os núcleos entre os processos do mesmo nó quando
+<code>OMP_NUM_THREADS</code> não está definido, e a FFT passou a abrir uma única
+região paralela em vez de uma por etapa. Com isso o tempo voltou a cair de forma
+monótona e não é mais preciso ajustar <code>OMP_NUM_THREADS</code> à mão.</p>
+
+<h2>10. Aplicação em um caso real</h2>
+
+<p>Para não ficar apenas em áudio sintético, aplicamos o programa a uma mensagem de
+voz real de nove segundos, gravada em celular e recebida por aplicativo de
+mensagens. O caminho completo tem três etapas e é a demonstração que consideramos
+mais interessante do trabalho, porque parte de um áudio de verdade, com ruído de
+verdade, e chega a um resultado audível.</p>
+
+<p><b>Primeiro, converter para o formato que o programa lê.</b> A mensagem veio em
+OGG com codec Opus, que o nosso leitor não aceita, então passou pelo
+<code>ffmpeg</code> e virou um WAV PCM de 16 bits, mono, 48000 Hz, com 434568
+amostras.</p>
+
+<p><b>Segundo, descobrir onde está o ruído.</b> Medindo o espectro das janelas mais
+silenciosas do arquivo, o piso de ruído tem RMS de 0,0078, ou seja -42,2 dBFS, e 78%
+da sua energia está abaixo de 300 Hz, enquanto a voz concentra 59% da energia entre
+300 Hz e 1 kHz. O ruído deste áudio é ronco de baixa frequência, não chiado, o que
+aponta diretamente para o filtro passa-alta. Uma pista disso apareceu de graça no
+próprio programa: rodando sem filtro nenhum, um dos blocos acusou frequência
+dominante de 60,06 Hz, que é a cara de um zumbido de rede elétrica.</p>
+
+<figure>
+  <img src="../prints/03-metricas-e-saidas.png" alt="Arquivos de saida e o CSV de metricas com 60,06 Hz">
+  <figcaption>Figura 4: os arquivos gerados e o CSV de métricas por bloco. A linha do
+  rank 1 acusa frequência dominante de 60,06 Hz, que é o zumbido de rede elétrica
+  presente no áudio original.</figcaption>
+</figure>
+
+<p><b>Terceiro, aplicar o passa-alta e normalizar.</b> Comparando as janelas mais
+silenciosas e as mais altas do arquivo, sempre nas mesmas posições em todas as
+versões, medimos:</p>
+
+<table>
+  <thead>
+    <tr><th>Versão</th><th class="num">SNR</th><th class="num">Piso de ruído</th><th class="num">Ruído abaixo de 300 Hz</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>original</td><td class="num">29,1 dB</td><td class="num">-42,2 dBFS</td><td class="num">78,4%</td></tr>
+    <tr><td><code>--threshold 0.01</code></td><td class="num">30,9 dB</td><td class="num">-41,3 dBFS</td><td class="num">54,2%</td></tr>
+    <tr><td><code>--passa-alta 32</code></td><td class="num">33,5 dB</td><td class="num">-50,1 dBFS</td><td class="num">3,5%</td></tr>
+    <tr><td><b><code>--passa-alta 48</code></b></td><td class="num"><b>35,0 dB</b></td><td class="num"><b>-48,7 dBFS</b></td><td class="num"><b>9,5%</b></td></tr>
+    <tr><td><code>--passa-alta 64</code></td><td class="num">35,3 dB</td><td class="num">-46,8 dBFS</td><td class="num">17,7%</td></tr>
+  </tbody>
+</table>
+
+<p>O raio 48 é o melhor equilíbrio. Ele atenua 32 dB em 60 Hz e 24 dB em 100 Hz, mas
+custa apenas 6 dB em 300 Hz, então derruba o ronco sem afinar a voz. O raio 32 limpa
+mais os graves, porém já tira 12 dB em 300 Hz e 4,4 dB em 500 Hz, onde está o corpo
+da fala. Depois do filtro, a frequência dominante do bloco que antes acusava 60 Hz
+passou a acusar 417,5 Hz, ou seja, o zumbido saiu e o que sobrou foi a voz.</p>
+
+<p><b>A tentativa que deu errado, e por quê.</b> A primeira coisa que tentamos neste
+áudio foi <code>--threshold 0.01</code> seguido de normalização, que é o filtro que
+o próprio nome sugere para remover ruído, e o resultado ficou audivelmente pior que
+o original. O motivo é instrutivo: o threshold é um gate por amostra, que zera
+qualquer amostra com módulo abaixo do limiar sem olhar o contexto. Como o piso de
+ruído deste arquivo é 0,0078, praticamente em cima do limiar de 0,01, o gate não
+cortou o ruído nas pausas: ele cortou dentro da própria forma de onda da fala,
+zerando 30,4% de todas as amostras, incluindo todo cruzamento por zero no meio da
+voz alta. Isso não remove ruído, adiciona distorção harmônica. E vale notar que o
+SNR medido até subiu um pouco, o que mostra que essa métrica sozinha não captura
+distorção. O arquivo ruim está guardado no repositório justamente como
+contraexemplo.</p>
+
+<h2>11. Limitações e trabalhos futuros</h2>
+
+<p><b>A varredura de desempenho multi-nó ainda não produziu números válidos.</b>
+Rodando a bateria com o arquivo de hosts de quatro vagas por máquina, o Open MPI
+preenche a <code>master</code> antes de usar os workers, então com quatro processos
+os quatro caem na mesma máquina de quatro núcleos e a varredura de threads passa a
+medir disputa por CPU em vez de escalabilidade. A correção é passar
+<code>--map-by node</code> nas execuções do <code>benchmark.sh</code>, para espalhar
+os ranks em vez de empilhá-los, e trocar a marcação de oversubscrição, que hoje
+compara processos vezes threads com os núcleos da máquina onde o script roda em vez
+dos núcleos por nó. É por isso que a tabela da seção 9 é da máquina de
+desenvolvimento e não do Xivoco.</p>
+
+<p><b>Uma das dezessete verificações falha em execução distribuída.</b> A
+verificação de que um raio maior que o menor bloco é recusado com erro claro passa
+quando tudo roda em uma máquina, mas falha quando os processos estão espalhados. O
+programa recusa o caso corretamente, o que se confirma pelo código de saída; o que a
+verificação não consegue é ler a mensagem de erro, aparentemente porque o
+<code>MPI_Abort</code> encerra o job antes que o texto vindo de outro nó chegue ao
+terminal. Ou seja, é uma limitação do teste e não do programa, mas precisa ser
+corrigida para que a bateria distribuída feche em dezessete de dezessete.</p>
+
+<p><b>O rank 0 é um gargalo por construção.</b> Centralizar o disco resolve o
+problema do sistema de arquivos, mas faz todo o conteúdo do arquivo trafegar pela
+rede duas vezes, como mostra a seção 9.2. Para áudios muito maiores o caminho
+natural seria processar em janelas, sobrepondo a leitura de um trecho com o
+processamento do anterior, em vez de carregar o arquivo inteiro na memória do rank 0
+antes de começar.</p>
+
+<p><b>A média móvel é um filtro cru.</b> Ela tem stopband pobre, então parte do
+ronco sobrevive em qualquer raio. Um filtro FIR projetado com uma janela adequada
+daria muito mais atenuação para o mesmo custo por amostra, e a estrutura de halo já
+implementada serviria sem mudança nenhuma.</p>
+
+<h2>12. Como reproduzir</h2>
+
+<pre># 1. clonar e compilar (nada alem de mpicc com OpenMP e libm)
+git clone https://github.com/ChristianKringel/trabalho-final-ippd
+cd trabalho-final-ippd
+make
+
+# 2. bateria de corretude (dezessete verificacoes)
+make check
+
+# 3. execucao em uma maquina
+mpirun -np 4 --bind-to none ./processa_audio \
+  data/entrada/testeLucas.wav data/saida/limpo.wav data/saida/metrica.csv \
+  --passa-alta 48 --normalizar 0.95
+
+# 4. execucao distribuida nos quatro nos do Xivoco
+printf 'master slots=1\nworker-1 slots=1\nworker-2 slots=1\nworker-3 slots=1\n' > maquinas.txt
+for no in worker-1 worker-2 worker-3; do
+  ssh $no "mkdir -p ~/trabalho-final-ippd"; scp processa_audio $no:~/trabalho-final-ippd/
+done
+mpirun -np 4 --hostfile maquinas.txt --bind-to none ./processa_audio \
+  /tmp/demo_ippd/testeLucas.wav /tmp/demo_ippd/saida.wav /tmp/demo_ippd/metrica.csv \
+  --passa-alta 48 --normalizar 0.95 --verbose</pre>
+
+<table class="larga">
+  <thead>
+    <tr><th>Caminho no repositório</th><th>Conteúdo</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>src/main.c</code></td><td>fluxo principal, Scatterv e Gatherv, halo, repartição de threads</td></tr>
+    <tr><td><code>src/wav_io.c</code></td><td>leitura e escrita de WAV PCM de 16 bits, escrita à mão</td></tr>
+    <tr><td><code>src/filtros.c</code></td><td>os filtros, com os laços paralelizados por OpenMP</td></tr>
+    <tr><td><code>src/fft.c</code></td><td>FFT de Cooley-Tukey iterativa e janela de Hann</td></tr>
+    <tr><td><code>src/metrica.c</code></td><td>RMS, pico e frequência dominante por bloco</td></tr>
+    <tr><td><code>scripts/benchmark.sh</code></td><td>bateria de corretude e varredura de desempenho</td></tr>
+    <tr><td><code>docs/resultados.md</code>, <code>docs/resultados.csv</code></td><td>tabelas de tempo geradas por <code>make bench</code></td></tr>
+    <tr><td><code>prints/</code></td><td>capturas de tela das execuções no Xivoco</td></tr>
+    <tr><td><code>README.md</code></td><td>documentação completa do projeto</td></tr>
+  </tbody>
+</table>
+
+<h2>13. Conclusão</h2>
+
+<p>O trabalho cumpre o que o enunciado pedia: um problema que manipula arquivo,
+resolvido com MPI e OpenMP em conjunto, rodando na plataforma Xivoco em quatro
+máquinas que não compartilham disco. A restrição do disco não ficou como detalhe de
+configuração; ela virou a decisão de arquitetura que organiza o programa inteiro, e
+está verificada no terminal, com três das quatro máquinas respondendo que o arquivo
+de entrada não existe enquanto o processamento roda normalmente nas quatro.</p>
+
+<p>Os dois níveis de paralelismo se justificam por medição, e não por suposição. O
+MPI responde pela maior parte do ganho, chegando a 6,5 vezes com oito processos,
+porque reduzir o tamanho do bloco reduz também o custo serial que existe dentro de
+cada rank. O OpenMP contribui com 2,8 vezes quando age sozinho, e os dois combinados
+funcionam desde que o número de threads acompanhe os núcleos disponíveis, o que o
+programa passou a fazer automaticamente depois que a oversubscrição apareceu nas
+medições.</p>
+
+<p>O que consideramos mais valioso de ter aprendido não são os números de speedup, e
+sim os dois casos em que a medição contrariou a intuição: a amarração de CPU do
+<code>mpirun</code>, que escondia completamente o efeito do OpenMP, e o filtro de
+threshold, que tem o nome certo para remover ruído e piorou o áudio de forma
+audível. Nos dois casos foi a medição que corrigiu o palpite, e é por isso que tanto
+a bateria de corretude quanto a varredura de tempos são scripts versionados no
+repositório em vez de números anotados à mão.</p>
