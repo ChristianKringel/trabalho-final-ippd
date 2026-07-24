@@ -1,0 +1,11 @@
+# Binarios e objetos
+*.o
+*.obj
+processa_audio
+test_wav
+
+# Saida temporaria do make test_wav
+data/saida/_teste_round_trip.wav
+
+# Diversos
+*.log
