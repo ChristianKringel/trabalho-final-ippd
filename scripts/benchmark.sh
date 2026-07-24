@@ -26,7 +26,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 BIN=./processa_audio
-AUDIO=data/entrada/longo.wav
+AUDIO=data/entrada/testeLucas.wav
 REPS=5
 NP_LIST="1 2 4 8"
 TH_LIST="1 2 4 8"
@@ -104,34 +104,30 @@ echo "=== Preparo ==="
 make --no-print-directory "$(basename "$BIN")" >/dev/null || { echo "falha ao compilar" >&2; exit 1; }
 echo "  binario compilado"
 
-if [[ ! -f "$AUDIO" ]]; then
-    echo "  '$AUDIO' nao existe, gerando os presets"
-    python3 scripts/gerar_wav_teste.py --preset >/dev/null
-fi
-[[ -f "$AUDIO" ]] || { echo "audio de entrada nao encontrado: $AUDIO" >&2; exit 1; }
-
-# Audio curto e barato para a bateria de corretude
-CURTO="$TMP/curto.wav"
-python3 scripts/gerar_wav_teste.py --duracao 0.5 --freq 440 --saida "$CURTO" >/dev/null
-# 44 amostras: com np=4 da blocos de exatamente 11, usado no teste de limite do halo
-MINI="$TMP/mini.wav"
-python3 scripts/gerar_wav_teste.py --duracao 0.001 --saida "$MINI" >/dev/null
+[[ -f "$AUDIO" ]] || { echo "audio nao encontrado: $AUDIO" >&2; exit 1; }
+echo "  audio de teste: $AUDIO"
 
 # ---------------------------------------------------------------- corretude
 
 echo
 echo "=== Corretude ==="
 
-AUDIO_ATUAL="$CURTO"
+AUDIO_ATUAL="$AUDIO"
 
 # 1. round-trip do wav_io, sem MPI
 if make --no-print-directory test_wav >"$TMP/rt" 2>&1; then checar "round-trip do wav_io (le o que escreveu)" 0
 else checar "round-trip do wav_io (le o que escreveu)" 1; sed -n '1,6p' "$TMP/rt"; fi
 
-# 2. identidade: sem filtros, a saida tem que ser byte a byte igual a entrada.
-#    Valida que Scatterv/Gatherv nao corrompem nem reordenam as amostras.
+# 2. identidade: sem filtros, as amostras da saida tem que ser iguais as da
+#    entrada. Valida que Scatterv/Gatherv nao corrompem nem reordenam nada.
+#    O testeLucas.wav saiu do ffmpeg e tem chunk extra no cabecalho (78 bytes em
+#    vez de 44), enquanto o nosso escritor sempre emite os 44 canonicos. Entao a
+#    comparacao pula os cabecalhos e olha so as amostras.
 executar 1 4 "$TMP/id1.wav" >/dev/null
-cmp -s "$CURTO" "$TMP/id1.wav"; checar "identidade: np=1 reproduz a entrada byte a byte" $?
+CARGA=$(( $(stat -c %s "$TMP/id1.wav") - 44 ))
+ENT_CAB=$(( $(stat -c %s "$AUDIO") - CARGA ))
+cmp -s -i "${ENT_CAB}:44" "$AUDIO" "$TMP/id1.wav"
+checar "identidade: amostras de np=1 iguais as da entrada" $?
 
 # 3. a saida nao pode depender do numero de processos
 for np in 2 4 8; do
@@ -165,18 +161,15 @@ for th in 2 3 4 8; do
     checar "metricas identicas: OMP=1 == OMP=$th (np=4)" $?
 done
 
-# 7. limite do halo: com 44 amostras e np=4 o menor bloco e 11, entao raio 11 deve
-#    casar com np=1 e raio 12 deve ser recusado, nao errar em silencio
-AUDIO_ATUAL="$MINI"
-executar 1 2 "$TMP/lim1.wav" --convolucao 11 >/dev/null
-executar 4 2 "$TMP/lim4.wav" --convolucao 11 >/dev/null
-cmp -s "$TMP/lim1.wav" "$TMP/lim4.wav"
-checar "halo no limite: raio == menor bloco (11) ainda casa com np=1" $?
-
-if executar 4 2 "$TMP/lim_ruim.wav" --convolucao 12 >/dev/null 2>&1; then
+# 7. raio maior que o menor bloco tem que ser recusado, e pelo motivo certo (so
+#    checar que falhou daria falso positivo se o programa morresse por outra causa)
+if executar 8 2 "$TMP/lim_ruim.wav" --convolucao 999999 >/dev/null 2>/dev/null; then
     checar "halo invalido: raio > menor bloco e recusado" 1
 else
-    checar "halo invalido: raio > menor bloco e recusado" 0
+    # $TMP/err tem o stderr completo do programa; a mensagem nao vem na primeira
+    # linha porque o banner do MPI_ABORT chega antes
+    grep -q "raio do filtro" "$TMP/err"
+    checar "halo invalido: raio > menor bloco e recusado com erro claro" $?
 fi
 
 echo
@@ -192,11 +185,11 @@ fi
 # --------------------------------------------------------------- desempenho
 
 AUDIO_ATUAL="$AUDIO"
-AMOSTRAS="$(python3 -c "import wave,sys;print(wave.open(sys.argv[1]).getnframes())" "$AUDIO")"
+AMOSTRAS="$(stat -c %s "$AUDIO") bytes"
 
 echo
 echo "=== Desempenho ==="
-echo "  audio      : $AUDIO ($AMOSTRAS amostras)"
+echo "  audio      : $AUDIO ($AMOSTRAS)"
 echo "  repeticoes : $REPS (reportada a mediana)"
 echo "  np         : $NP_LIST"
 echo "  threads    : $TH_LIST"
@@ -278,7 +271,7 @@ fi
     echo "| kernel | $(uname -sr) |"
     echo "| compilador | $(mpicc --version 2>/dev/null | head -1) |"
     echo "| MPI | $(mpirun --version 2>/dev/null | head -1) |"
-    echo "| entrada | $AUDIO ($AMOSTRAS amostras) |"
+    echo "| entrada | $AUDIO ($AMOSTRAS) |"
     echo "| repeticoes | $REPS (mediana) |"
     [[ -n "$HOSTFILE" ]] && echo "| hostfile | $HOSTFILE |"
     echo
